@@ -11643,7 +11643,14 @@ int ggml_cuda_moe_ring_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
                 const size_t bytes = p.e == n_expert - 1 ? span : stride;
                 const char * from = src_row[p.e] ? src_row[p.e] : lo + (size_t) p.e*stride;
                 r.from_mapping += !src_row[p.e] && !device->arenas.empty();
-                CUDA_CHECK(cudaMemcpyAsync(dst, from, bytes, cudaMemcpyHostToDevice, r.copy));
+#if defined(GGML_USE_HIP)
+                // the mapping is pageable: the runtime stages such a copy on the SDMA ring, whose one
+                // lane it can then hold for good (every later DMA of the device queues behind it)
+                if (src_row[p.e] || !ggml_cuda_host_copy_bounce(dst, 0, from, 0, bytes, 1, r.copy))
+#endif
+                {
+                    CUDA_CHECK(cudaMemcpyAsync(dst, from, bytes, cudaMemcpyHostToDevice, r.copy));
+                }
                 if (bytes < stride) {
                     CUDA_CHECK(cudaMemsetAsync(dst + bytes, 0, stride - bytes, r.copy));
                 }

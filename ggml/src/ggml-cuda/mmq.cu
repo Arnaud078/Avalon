@@ -990,13 +990,38 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     quantize_scatter_mmq_q8_1_cuda((const float *) x->data, ids_src1.get(), q8_gu.get(), wg->type, n_embd,
         x->nb[2] / sizeof(float), ne10p_gu, n_tok, rows, (int) n_used, stream);
     ggml_cuda_pool_alloc<uint64_t> xe_dev(ctx.pool(), xe_host ? 3*n_expert : 1);
+    // pageable host memory makes the runtime stage these copies on the SDMA ring, whose one lane a prefill's expert
+    // copies can hold for good: the host then blocks inside the copy call (seen with the bounds, a ring block's graph)
+    static std::mutex pin_mu;
+    static char * pin = nullptr;
+    static size_t pin_bytes = 0;
+    const size_t xe_bytes = xe_host ? 3*n_expert*sizeof(uint64_t) : 0;
+    const size_t pin_need = xe_bytes + (n_expert + 1)*sizeof(int32_t);
+    std::lock_guard<std::mutex> pin_lock(pin_mu);
+    if (pin_bytes < pin_need) {
+        if (pin) {
+            CUDA_CHECK(cudaFreeHost(pin));
+            pin = nullptr;
+            pin_bytes = 0;
+        }
+        if (cudaMallocHost((void **) &pin, pin_need) == cudaSuccess) {
+            pin_bytes = pin_need;
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
     if (xe_host) {
         for (int k = 0; k < 3; k++) {
-            CUDA_CHECK(cudaMemcpyAsync(xe_dev.get() + k*n_expert, xe_host[k].data(), n_expert*sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+            const void * xe_src = xe_host[k].data();
+            if (pin) {
+                memcpy(pin + k*n_expert*sizeof(uint64_t), xe_src, n_expert*sizeof(uint64_t));
+                xe_src = pin + k*n_expert*sizeof(uint64_t);
+            }
+            CUDA_CHECK(cudaMemcpyAsync(xe_dev.get() + k*n_expert, xe_src, n_expert*sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
         }
     }
     std::vector<int32_t> hb(n_expert + 1);
-    CUDA_CHECK(cudaMemcpyAsync(hb.data(), bounds.get(), (n_expert + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(pin ? (int32_t *) (pin + xe_bytes) : hb.data(), bounds.get(), (n_expert + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     // GGML_CUDA_MOE_GROUPED_TIMING=1: the host's wait in this synchronization, and the stream's idle time after it (the
     // time to queue the first group), every 48 blocks
     static const bool timing = getenv("GGML_CUDA_MOE_GROUPED_TIMING") && atoi(getenv("GGML_CUDA_MOE_GROUPED_TIMING")) != 0;
@@ -1005,6 +1030,9 @@ static int moe_block_grouped_impl(ggml_backend_cuda_context & ctx, const ggml_cg
     static int64_t t_wait = 0, n_blocks = 0, t_gap = 0;
     const int64_t t_sync1 = timing ? ggml_time_us() : 0;
 
+    if (pin) {
+        memcpy(hb.data(), pin + xe_bytes, (n_expert + 1)*sizeof(int32_t));
+    }
     if (hooks && hooks->bounds) {
         *hooks->bounds = hb;
     }
