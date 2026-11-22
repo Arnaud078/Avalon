@@ -4331,6 +4331,9 @@ static void moe_cache_log_stats(moe_cache_device & device) {
     }
 }
 
+// the hosted pipeline timeline, from the hosted states created after this point (defined below them)
+static void moe_cache_stats_hosted(moe_cache_session & session, struct ggml_moe_cache_stats * out);
+
 // the device's memory, counters and miss latency, for the server's metrics and log (ggml_backend_sched_moe_cache_stats)
 static bool moe_cache_stats(void * opaque, struct ggml_moe_cache_stats * out) {
     if (!opaque || !out) {
@@ -4419,6 +4422,7 @@ static bool moe_cache_stats(void * opaque, struct ggml_moe_cache_stats * out) {
         device.lat_disk.copy_to(&ds->disk);
     }
 
+    moe_cache_stats_hosted(session, out);
     return out->n_devices > 0;
 }
 
@@ -8081,11 +8085,12 @@ static T * moe_hosted_device_ptr(T * host) {
     return cudaHostGetDevicePointer(&dev, host, 0) == cudaSuccess ? (T *) dev : nullptr;
 }
 
-// DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE=N; HIP: wall clock, CUDA: global timer): a timeline of the hosted layers without a profiler, every N layers. The
-// GPU writes its wall clock to mapped host memory, per layer (seq % MOE_TL_RING): [0] publication, [1] plan seen,
-// [2] the CPU rows' flag seen by the merge (0: no CPU row). The host keeps its own times: publication seen, plan
-// flag written, CPU rows' flag written. No clock synchronization: the relays (GPU -> host -> GPU) come out of
-// differences of durations measured on one side each.
+// DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE=N logs every N layers; HIP: wall clock, CUDA: global timer): a timeline of the
+// hosted layers without a profiler. The GPU writes its wall clock to mapped host memory, per layer (seq %
+// MOE_TL_RING): [0] publication, [1] plan seen, [2] the CPU rows' flag seen by the merge (0: no CPU row). The host
+// keeps its own times: publication seen, plan flag written, CPU rows' flag written. No clock synchronization: the
+// relays (GPU -> host -> GPU) come out of differences of durations measured on one side each. The ring is per device
+// and allocated unless GGML_CUDA_MOE_PHASE_STATS=0: the sums feed the server's hosted phase metrics.
 #define MOE_TL_RING 1024
 #define MOE_TL_W 16   // the stamps of a layer in g_tl_h ([8] plan copied, [9] chunk list written: the entry kernel)
 static unsigned long long * g_tl_h = nullptr;   // host view
@@ -10441,7 +10446,10 @@ static void moe_hosted_pregate(moe_hosted_state * st, uint32_t slot, moe_hosted_
 // DIAGNOSTIC (GGML_CUDA_MOE_TIMELINE): called once the layer seq's CPU rows are handed back; accounts the layer
 // seq - 1 (its merge is done: the GPU published seq after it) with the publication of seq
 static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
-    static const int every = atoi(getenv("GGML_CUDA_MOE_TIMELINE"));
+    static const int every = []() {
+        const char * v = getenv("GGML_CUDA_MOE_TIMELINE");
+        return v ? atoi(v) : 0;
+    }();
     const uint32_t p = seq - 1;
     int64_t * h  = st->tl_host.data();
     int64_t * hp = h + (p % MOE_TL_RING) * 3, * hs = h + (seq % MOE_TL_RING) * 3;
@@ -10527,7 +10535,7 @@ static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
         a[8] += gp[4] ? ((double) gp[4] - (double) ge2) * k : 0;    // hosting card: plan seen -> merge reached
         a[9] += ((double) c[1] - (double) c[0]) > 0 ? ((double) c[1] - (double) c[0]) * k : 0;   // idle before the plan
     }
-    if (st->tl_n % every == 0) {
+    if (every > 0 && st->tl_n % every == 0) {
         for (const moe_split_card & card : st->split_cards) {
             const double * a = st->tlk_sum[card.index];
             if (a[0] > 0) {
@@ -10567,6 +10575,24 @@ static void moe_tl_account(moe_hosted_state * st, uint32_t seq) {
                 "(%.1f %%, wait %.1f us); no wait %.1f (%.1f %%, wait %.1f us)\n",
                 a[24] / w0 / 1e3, 100 * a[27] / nw, a[30] / w0 / 1e3, a[33] / w0 / 1024, a[35] / w0 / 1e3, a[34] / w0 / 1e3,
                 a[25] / w1 / 1e3, 100 * a[28] / nw, a[31] / w1 / 1e3, a[26] / w2 / 1e3, 100 * a[29] / nw, a[32] / w2 / 1e3);
+    }
+}
+
+// the hosted pipeline timeline, for the server's metrics: each card's tl_sum, from its hosted state
+static void moe_cache_stats_hosted(moe_cache_session & session, struct ggml_moe_cache_stats * out) {
+    std::lock_guard<std::mutex> lock(g_hosted_mu);
+    for (int i = 0; i < out->n_devices; i++) {
+        auto it = g_hosted.find({&session, out->devices[i].logical});
+        if (it == g_hosted.end() || !it->second) {
+            continue;
+        }
+        const moe_hosted_state & st = *it->second;
+        struct ggml_moe_hosted_phases * hp = &out->devices[i].hosted;
+        for (int j = 0; j < 18; j++) {
+            hp->tl_ns[j] = st.tl_sum[j] > 0 ? (uint64_t) st.tl_sum[j] : 0;
+        }
+        hp->n_plan = st.tl_n;
+        hp->n_win  = st.tl_nw;
     }
 }
 
@@ -11346,7 +11372,11 @@ static moe_hosted_state * moe_hosted_state_for(moe_cache_session & session, moe_
         (void) cudaGetLastError();
         return nullptr;
     }
-    if (getenv("GGML_CUDA_MOE_TIMELINE") && atoi(getenv("GGML_CUDA_MOE_TIMELINE")) > 0) {
+    static const bool phase_stats = []() {
+        const char * v = getenv("GGML_CUDA_MOE_PHASE_STATS");
+        return !v || atoi(v) != 0;
+    }();
+    if (phase_stats) {
         int rate_khz = 0;
 #if defined(GGML_USE_HIP)
         (void) hipDeviceGetAttribute(&rate_khz, hipDeviceAttributeWallClockRate, device.logical);
@@ -11471,6 +11501,10 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
         layer->down_pool_index = layer->pool_index;
         if (layer->pool_index < 0 || moe_cache_pool_of(device, up_w->data) != layer->pool_index ||
             moe_cache_pool_of(device, down_w->data) != layer->pool_index) {
+            if (getenv("GGML_MOE_HOSTED_DEBUG") && atoi(getenv("GGML_MOE_HOSTED_DEBUG"))) {
+                GGML_LOG_INFO("hosted blk dbg: register %s dev %d pools %d %d %d\n", gate_w->name, device.logical,
+                        layer->pool_index, moe_cache_pool_of(device, up_w->data), moe_cache_pool_of(device, down_w->data));
+            }
             return nullptr;
         }
         const moe_cache_pool & pool = *device.pools[layer->pool_index];
@@ -11478,6 +11512,9 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
         if (pool.role_bytes[MOE_ROLE_UP] != (size_t) (up_w->nb[1]*up_w->ne[1]) ||
             pool.role_bytes[MOE_ROLE_GATE] != (size_t) (gate_w->nb[1]*gate_w->ne[1]) ||
             pool.role_bytes[MOE_ROLE_DOWN] != (size_t) (down_w->nb[1]*down_w->ne[1])) {
+            if (getenv("GGML_MOE_HOSTED_DEBUG") && atoi(getenv("GGML_MOE_HOSTED_DEBUG"))) {
+                GGML_LOG_INFO("hosted blk dbg: register %s dev %d role_bytes mismatch\n", gate_w->name, device.logical);
+            }
             return nullptr;
         }
         layer->base = device.pools[layer->pool_index]->gpu_base;
@@ -12720,8 +12757,15 @@ static moe_warm_args moe_warm_collect(const ggml_backend_cuda_context & ctx, con
 }
 
 int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
-    if (i + 3 >= cgraph->n_nodes) {
+    static const bool dbg = getenv("GGML_MOE_HOSTED_DEBUG") && atoi(getenv("GGML_MOE_HOSTED_DEBUG"));
+    const auto decline = [&](const char * why) {
+        if (dbg && i < cgraph->n_nodes && strstr(cgraph->nodes[i]->name, "moe_gate")) {
+            GGML_LOG_INFO("hosted blk dbg: %s dev %d decline %s\n", cgraph->nodes[i]->name, ctx.device, why);
+        }
         return -1;
+    };
+    if (i + 3 >= cgraph->n_nodes) {
+        return decline("short");
     }
     ggml_tensor * n0 = cgraph->nodes[i];
     ggml_tensor * n1 = cgraph->nodes[i + 1];
@@ -12729,12 +12773,12 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     ggml_tensor * down = cgraph->nodes[i + 3];
     if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
         n0->op != GGML_OP_MUL_MAT_ID || n1->op != GGML_OP_MUL_MAT_ID || down->op != GGML_OP_MUL_MAT_ID) {
-        return -1;
+        return decline("pattern");
     }
     ggml_tensor * gate = glu->src[0];
     ggml_tensor * up = glu->src[1];
     if (!((gate == n0 && up == n1) || (gate == n1 && up == n0)) || down->src[1] != glu) {
-        return -1;
+        return decline("order");
     }
     const ggml_tensor * act = gate->src[1];
     const ggml_tensor * ids = gate->src[2];
@@ -12744,10 +12788,10 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
     if (up->src[1] != act || up->src[2] != ids || down->src[2] != ids || rows > moe_hosted_max_rows() || n_tokens > moe_hosted_tokens_max ||
         act->type != GGML_TYPE_F32 || act->ne[1] != 1 || !ggml_is_contiguous(act) || !ggml_is_contiguous(glu) ||
         !ggml_is_contiguous(down) || gate->src[0]->type != up->src[0]->type) {
-        return -1;
+        return decline("limits");
     }
     if (g_session_stack.empty() || !g_session_stack.back().active) {
-        return -1;
+        return decline("session");
     }
     moe_cache_session & session = *g_session_stack.back().active;
     moe_cache_device * device = nullptr;
@@ -12757,16 +12801,16 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
         }
     }
     if (!device) {
-        return -1;
+        return decline("device");
     }
     moe_hosted_state * st = moe_hosted_state_for(session, *device);
     if (!st) {
-        return -1;
+        return decline("state");
     }
     int slot = -1;
     moe_hosted_layer * layer = moe_hosted_register(*st, *device, gate->src[0], up->src[0], down->src[0], n_used, slot);
     if (!layer) {
-        return -1;
+        return decline("register");
     }
     if (!st->gpu_benched) {
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;

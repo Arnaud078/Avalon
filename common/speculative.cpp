@@ -2018,6 +2018,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         } stat_sc { stat_t0, stat_draft_us };
         auto & ctx_dft = params.ctx_dft;
 
+        // DIAGNOSTIC (LLAMA_MTP_TIMING=1): wall time of the draft() phases, every 200 rounds: the setup before the
+        // first pass, each pass, the sampling and batch rebuild between passes, and the rest
+        static const bool mt_on = getenv("LLAMA_MTP_TIMING") && atoi(getenv("LLAMA_MTP_TIMING")) != 0;
+        static int64_t mt_all = 0, mt_pre = 0, mt_p[3] = {}, mt_sm = 0;
+        static int mt_n = 0;
+        const int64_t mt_t0 = mt_on ? ggml_time_us() : 0;
+
         // DIAGNOSTIC (LLAMA_MTP_KV_HASH=1): the draft's state of each drafting sequence at the first draft after a
         // prompt batch (its K/V of the prompt) and its deferred rows, hashed: the paths that feed it (host rows, device
         // rows per ubatch) compare on it
@@ -2110,6 +2117,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        if (mt_on) {
+            mt_pre += ggml_time_us() - mt_t0;
+        }
+
         int i = 0;
 
         while (n_drafting > 0) {
@@ -2129,7 +2140,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t mt_tp = mt_on ? ggml_time_us() : 0;
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (mt_on) {
+                mt_p[i < 3 ? i : 2] += ggml_time_us() - mt_tp;
+            }
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -2146,6 +2161,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
             // whole prefix at the next head. dropped sequences are simply not re-added.
+            const int64_t mt_ts = mt_on ? ggml_time_us() : 0;
             batch.clear();
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2244,6 +2260,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
+            if (mt_on) {
+                mt_sm += ggml_time_us() - mt_ts;
+            }
+
             if (batch.size() == 0) {
                 break;
             }
@@ -2268,6 +2288,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (adapt_on && dp.result->empty()) {
                 adapt[seq_id].ch.clear();
                 adapt[seq_id].t_prev = 0;   // a step without drafts: the next one's clock starts again
+            }
+        }
+
+        if (mt_on) {
+            mt_all += ggml_time_us() - mt_t0;
+            if (++mt_n % 200 == 0) {
+                const double f = 1e-3 / 200;
+                SPC_INF("draft timing: %d rounds, ms/round: setup %.2f, pass0 %.2f, pass1 %.2f, pass+ %.2f, sample %.2f, rest %.2f\n",
+                        mt_n, mt_pre*f, mt_p[0]*f, mt_p[1]*f, mt_p[2]*f, mt_sm*f,
+                        (mt_all - mt_pre - mt_p[0] - mt_p[1] - mt_p[2] - mt_sm)*f);
+                mt_all = mt_pre = mt_sm = 0;
+                mt_p[0] = mt_p[1] = mt_p[2] = 0;
             }
         }
     }

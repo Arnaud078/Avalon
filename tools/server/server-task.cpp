@@ -1785,6 +1785,23 @@ std::string server_task_result_metrics::to_metrics() {
             counter("arena_zone_full_total",     "Arena reads attempted while the prefill zone was full", ds.arena_zone_full);
             gauge("arena_usage_bytes", "Bytes of the expert arena holding an expert", (double) ds.arena_used_bytes);
 
+            if (ds.hosted.n_plan > 0) {
+                static const char * hosted_phase_names[10] = { "plan_gpu_wait", "plan_host", "rows_window_gpu", "rows_window_host",
+                        "gpu_segment", "host_gap", "late", "moved_copy", "gpu_work", "window_host" };
+                static const int hosted_phase_idx[10] = { 0, 1, 2, 3, 4, 5, 12, 13, 16, 17 };
+                for (int ph = 0; ph < 10; ph++) {
+                    add_avalon(ss, seen, "counter", "hosted_phase_seconds_total",
+                            "Time the hosted MoE pipeline spent in one phase, per device (plan_gpu_wait: the entry "
+                            "kernel's wait for the layer plan; host_gap: whole layer period on the host)",
+                            "{device=\"" + dev + "\",phase=\"" + hosted_phase_names[ph] + "\"}",
+                            (double) ds.hosted.tl_ns[hosted_phase_idx[ph]] / 1e9);
+                }
+                labeled("hosted_layers_total", "Hosted layers accounted by the pipeline timeline", "relay", "plan",       ds.hosted.n_plan);
+                labeled("hosted_layers_total", "Hosted layers accounted by the pipeline timeline", "relay", "window",     ds.hosted.n_win);
+                labeled("hosted_layers_total", "Hosted layers accounted by the pipeline timeline", "relay", "late_copy",  ds.hosted.tl_ns[6]);
+                labeled("hosted_layers_total", "Hosted layers accounted by the pipeline timeline", "relay", "late_other", ds.hosted.tl_ns[7]);
+            }
+
             add_avalon_histogram(ss, seen, "moe_miss_fill_seconds", "Time to copy a missed expert into the GPU expert cache",
                     dev.c_str(), ds.fill);
             add_avalon_histogram(ss, seen, "moe_miss_wait_seconds", "Time a missed expert spent queued before its copy started",

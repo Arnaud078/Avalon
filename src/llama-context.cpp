@@ -2048,8 +2048,15 @@ static bool llama_ubatch_timing() {
     return on;
 }
 
+// DIAGNOSTIC (LLAMA_UBATCH_TIMING>=2): the same phases, aggregated for the small ubatches (decodes, draft passes),
+// one line per 100 ubatches and per context
+static bool llama_ubatch_timing_small() {
+    static const bool on = getenv("LLAMA_UBATCH_TIMING") && atoi(getenv("LLAMA_UBATCH_TIMING")) >= 2;
+    return on;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, bool launch) {
-    const bool ut = llama_ubatch_timing() && ubatch.n_tokens > 1024;
+    const bool ut = llama_ubatch_timing() && (ubatch.n_tokens > 1024 || (llama_ubatch_timing_small() && ubatch.n_tokens <= 8));
     int64_t ut_t[8] = {};
     if (ut) { ut_t[0] = ggml_time_us(); }
     if (mctx && !mctx->apply()) {
@@ -2159,12 +2166,42 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // the GPU's end of this graph, to tell the launch from the wait for the device
         ggml_backend_sched_synchronize(sched.get());
         ut_t[7] = ggml_time_us();
-        const auto ms = [&](int a, int b) { return ut_t[a] && ut_t[b] ? (ut_t[b] - ut_t[a]) / 1e3 : 0.0; };
-        LLAMA_LOG_INFO("%s: ubatch timing (%u tokens%s): since the previous one's end %.1f, apply %.1f, build %.1f, alloc %.1f, "
-                "inputs %.1f, kv %.1f, launch %.1f, gpu wait %.1f ms\n",
-                __func__, ubatch.n_tokens, ut_t[1] ? "" : ", graph reused", ut_after_us ? (ut_t[0] - ut_after_us) / 1e3 : 0.0,
-                ut_t[1] ? ms(0, 1) : ms(0, 3), ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6), ms(6, 7));
-        ut_after_us = ut_t[7];
+        if (ubatch.n_tokens > 1024) {
+            const auto ms = [&](int a, int b) { return ut_t[a] && ut_t[b] ? (ut_t[b] - ut_t[a]) / 1e3 : 0.0; };
+            LLAMA_LOG_INFO("%s: ubatch timing (%u tokens%s): since the previous one's end %.1f, apply %.1f, build %.1f, alloc %.1f, "
+                    "inputs %.1f, kv %.1f, launch %.1f, gpu wait %.1f ms\n",
+                    __func__, ubatch.n_tokens, ut_t[1] ? "" : ", graph reused", ut_after_us ? (ut_t[0] - ut_after_us) / 1e3 : 0.0,
+                    ut_t[1] ? ms(0, 1) : ms(0, 3), ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6), ms(6, 7));
+            ut_after_us = ut_t[7];
+        } else {
+            // bucket by n_tokens: the 1-token ubatches are the draft's own passes, the 2-4 ones are the target's
+            // verifications and the draft's first pass (its rows copied during the target's decode)
+            struct ut_small_acc { int64_t s[8]; int n; int rb; };
+            static std::unordered_map<uintptr_t, ut_small_acc> ut_sm;
+            const uintptr_t key = (uintptr_t) this*8 + (ubatch.n_tokens == 1 ? 0 : ubatch.n_tokens <= 4 ? 1 : 2);
+            auto & a = ut_sm[key];
+            a.n++;
+            a.s[0] += ut_t[7] - ut_t[0];
+            if (ut_t[1]) {
+                a.rb++;
+                a.s[1] += ut_t[1] - ut_t[0];
+                a.s[2] += ut_t[2] - ut_t[1];
+                a.s[3] += ut_t[3] - ut_t[2];
+            } else {
+                a.s[4] += ut_t[3] - ut_t[0];
+            }
+            a.s[5] += ut_t[4] - ut_t[3];
+            a.s[6] += ut_t[5] - ut_t[4];
+            a.s[7] += ut_t[6] - ut_t[5];
+            if (a.n % 100 == 0) {
+                const double f = 1e-3 / 100;
+                LLAMA_LOG_INFO("%s: small ubatch timing: ctx %p n_ctx %u, %u-token bucket, %d ubatches (%d rebuilt), ms/ubatch: "
+                        "total %.2f, apply %.2f, build %.2f, alloc %.2f, reused apply+set %.2f, inputs %.2f, kv %.2f, launch %.2f\n",
+                        __func__, (void *) this, cparams.n_ctx, ubatch.n_tokens, a.n, a.rb, a.s[0]*f, a.s[1]*f, a.s[2]*f, a.s[3]*f, a.s[4]*f,
+                        a.s[5]*f, a.s[6]*f, a.s[7]*f);
+                a = {};
+            }
+        }
     }
 
     return ret == GGML_STATUS_SUCCESS ? res : nullptr;

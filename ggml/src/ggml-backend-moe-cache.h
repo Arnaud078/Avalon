@@ -117,6 +117,18 @@ struct ggml_moe_cache_latency {
 
 #define GGML_MOE_CACHE_MAX_DEVICES 16
 
+// Hosted pipeline timeline, ns sums since start (0 until the card hosts layers).
+// tl_ns[0] GPU: publication -> plan seen (the enter's wait); [1] host: publication seen -> plan flag;
+// [2]/[3] GPU/host: plan flag -> CPU rows' flag; [4] GPU: rows' flag -> next publication; [5] host gap over a layer;
+// [6]/[7] layers late at the merge, waiting for a moved expert copy / for anything else; [8]/[9] their late ns;
+// [10]/[11] their moved-copy ns; [12] late ns all; [13] moved-copy ns all; [14]/[15] GPU work in the late layers'
+// window (with / without a moved copy); [16] GPU work in the window, all layers; [17] host window, all layers
+struct ggml_moe_hosted_phases {
+    uint64_t tl_ns[18];
+    uint64_t n_plan;   // layers the plan relay accounted
+    uint64_t n_win;    // layers the CPU rows' window accounted
+};
+
 struct ggml_moe_cache_device_stats {
     int32_t logical;        // the ggml CUDA device index of the card
     int32_t host_shared;    // EXPERT SPLIT: the host pin/arena belongs to another card
@@ -142,6 +154,8 @@ struct ggml_moe_cache_device_stats {
     struct ggml_moe_cache_latency fill; // host -> device copy of one missed expert
     struct ggml_moe_cache_latency wait; // job queued -> fill started
     struct ggml_moe_cache_latency disk; // O_DIRECT read of one expert into the arena
+
+    struct ggml_moe_hosted_phases hosted;
 };
 
 struct ggml_moe_cache_stats {

@@ -1561,7 +1561,12 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
         sched->moe_hosted->clear();
     }
     sched->moe_hosted_ring_rows = INT64_MAX;
+    static const bool dbg = getenv("GGML_MOE_HOSTED_DEBUG") && atoi(getenv("GGML_MOE_HOSTED_DEBUG"));
     if (!enabled || !sched->moe_cache_session || !ggml_moe_cache.cpu_experts) {
+        if (dbg) {
+            GGML_LOG_INFO("hosted dbg %p: off (enabled %d session %p cpu_experts %d)\n", (void *) sched, enabled,
+                    sched->moe_cache_session, ggml_moe_cache.cpu_experts != nullptr);
+        }
         return;
     }
     if (!sched->moe_hosted) {
@@ -1585,6 +1590,14 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
             !host_weights(gate) || !host_weights(up) || !host_weights(down) ||
             gate->src[2] != ids || up->src[2] != ids || gate->src[1] != up->src[1] ||
             (!in_limits && !(ring_prefill && ids->ne[1] >= 128 && ggml_sched_packed_expert_step(gate->src[0])))) {
+            if (dbg && host_weights(gate) && host_weights(up) && host_weights(down)) {
+                GGML_LOG_INFO("hosted dbg %p: %s not a candidate (order %d ids %d embd %d limits %d rows %lld tok %d maxr %lld)\n",
+                        (void *) sched, gate->name,
+                        (gate == graph->nodes[i] && up == graph->nodes[i + 1]) || (gate == graph->nodes[i + 1] && up == graph->nodes[i]),
+                        ids && gate->src[2] == ids && up->src[2] == ids, ids && gate->src[1] == up->src[1],
+                        in_limits, (long long) (ids ? ids->ne[0] * ids->ne[1] : -1), (int) (ids ? ids->ne[1] : -1),
+                        (long long) max_rows);
+            }
             continue;
         }
         // the ring streams a packed layer's experts (gate, up and down of an expert in one row) and nothing else: an
@@ -1595,6 +1608,9 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
         // under 512): ggml-cuda cannot host it, it runs on the CPU (before: an abort in ggml-cuda at the first graph)
         if (ggml_moe_cache.hosts &&
                 !ggml_moe_cache.hosts(sched->moe_cache_session, gate->src[0]->data, up->src[0]->data, down->src[0]->data)) {
+            if (dbg) {
+                GGML_LOG_INFO("hosted dbg %p: %s refused by hosts()\n", (void *) sched, gate->name);
+            }
             i += 3;
             continue;
         }
@@ -1632,6 +1648,10 @@ static void ggml_backend_sched_find_hosted_moe(ggml_backend_sched_t sched, const
     // ring against 1.3 - 1.5 / 1.7 - 1.9 / 2.3 - 2.7 s hosted; they meet at ~800 tokens, the hosted path's 8191 rows
     // (12 Nov.; seen on an RX 6800 XT too, #46)
     for (const auto & c : candidates) {
+        if (dbg) {
+            GGML_LOG_INFO("hosted dbg %p: %s rows %lld limit %lld -> %s\n", (void *) sched, c.gate->name,
+                    (long long) c.rows, (long long) limit, (c.rows <= limit || c.ring) ? "hosted" : "prefetch");
+        }
         if (c.rows <= limit || c.ring) {
             sched->moe_hosted->insert(c.gate);
             sched->moe_hosted->insert(c.up);
